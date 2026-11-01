@@ -263,7 +263,7 @@ a{color:var(--acc);text-decoration:none}.mut{color:var(--mut)}.dot{display:inlin
 dl{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;margin:0}dt{color:var(--mut)}dd{margin:0}
 .note{color:var(--mut);font-size:12px;line-height:1.5}.side td{white-space:normal}
 footer{color:var(--mut);font-size:12px;padding:0 20px 20px;max-width:1500px;margin:0 auto}
-.leaflet-container{background:#0b0f13}.arr{background:none;border:none}
+.leaflet-container{background:#0b0f13}.darktiles{filter:invert(1) hue-rotate(180deg) brightness(.85) contrast(.9) saturate(.6)}.arr{background:none;border:none}
 </style></head><body>
 <header><h1>mil-watch</h1>
 <nav id="tabs"><button data-t="live" class="on">Agora</button><button data-t="regions">Regiões</button>
@@ -303,7 +303,7 @@ function fitLayer(){if(!map||!fitNext)return;fitNext=false;const ls=layer.getLay
  const g=L.featureGroup(ls);try{map.fitBounds(g.getBounds(),{padding:[30,30],maxZoom:6})}catch(e){}}
 let map=null,layer=null,overlay=null;
 if(window.L){map=L.map("map",{worldCopyJump:true,minZoom:2}).setView([20,0],2);
- L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",{maxZoom:12,attribution:"&copy; OpenStreetMap &copy; CARTO"}).addTo(map);
+ L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",{maxZoom:12,className:"darktiles",attribution:'&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'}).addTo(map);
  layer=L.layerGroup().addTo(map);overlay=L.layerGroup().addTo(map);
 }else{$("map").innerHTML='<p class="mut pad">Mapa indisponível (biblioteca de mapas não carregou).</p>'}
 async function j(u){const r=await fetch(u);if(!r.ok)throw new Error("HTTP "+r.status);return r.json()}
