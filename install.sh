@@ -584,12 +584,12 @@ def predict_destination(con, a, bases, top=3):
         if diff > limit:
             continue
         hx, cs = history_hits(con, a.get("hex"), a.get("callsign"), b)
-        score = diff / 30 + 0.15 * dist / 1000 - 0.5 * min(hx, 4) / 4 - 0.25 * min(cs, 4) / 4
+        score = diff / 30 + 0.4 * dist / 1000 - 0.5 * min(hx, 4) / 4 - 0.25 * min(cs, 4) / 4
         if descending:
             score += dist / 300
         if (hx >= 2 and diff < 12) or (descending and dist < 120 and diff < 20):
             conf = "alta"
-        elif diff < 15 or hx >= 1:
+        elif hx >= 1 or (diff < 15 and dist / (gs * 1.852) <= 3):
             conf = "média"
         else:
             conf = "baixa"
