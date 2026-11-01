@@ -45,7 +45,8 @@ mkdir -p "$APP_DIR/data"
 if [ -f "$APP_DIR/data/milwatch.db" ]; then
   systemctl stop "$SERVICE" "$SERVICE-dashboard" 2>/dev/null || true
   cp "$APP_DIR/data/milwatch.db" "$APP_DIR/data/milwatch.db.bak-$(date +%Y%m%d-%H%M%S)"
-  say "Backup do banco feito em $APP_DIR/data/"
+  ls -1t "$APP_DIR"/data/milwatch.db.bak-* 2>/dev/null | tail -n +4 | xargs -r rm -f
+  say "Backup do banco feito em $APP_DIR/data/ (mantidos os 3 mais recentes)"
 fi
 '''
 
