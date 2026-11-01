@@ -100,6 +100,14 @@ class Flow(unittest.TestCase):
         self.assertTrue(any("emergência geral" in m for m in out))   # emergência alerta por padrão
         self.assertEqual(types.count("mudanca_rota"), 1)
 
+    def test_us_domestic_emergency_not_sent(self):
+        con = new_db()
+        mw.cycle(con, [ac("ae4d3b", 32.4, -100.2, 270, alt=3825, t="H60")], T0)
+        out = mw.cycle(con, [ac("ae4d3b", 32.4, -100.3, 270, alt=3825, t="H60", squawk="7700")], T0 + 90)
+        self.assertEqual(out, [])
+        self.assertEqual(con.execute("SELECT type, region FROM events").fetchall(),
+                         [("emergencia", "América do Norte")])
+
     def test_orbit_event_once(self):
         con = new_db()
         lat, lon, trk, t = 44.0, 31.0, 90, T0

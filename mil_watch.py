@@ -53,6 +53,9 @@ SENSITIVE_REGIONS = {r.strip() for r in env(
     "Brasil,América do Sul,Caribe e América Central,Mar Negro,Europa Oriental e Báltico,Rússia Ocidental,"
     "Oriente Médio e Golfo,Mar Vermelho e Chifre da África,Mar do Sul da China e Taiwan,Leste Asiático"
 ).split(",") if r.strip()}
+# Regiões cujos eventos ficam só no painel, sem Telegram (ex.: treinos domésticos dos EUA)
+ALERT_IGNORE_REGIONS = {r.strip() for r in env("ALERT_IGNORE_REGIONS", "América do Norte,Alasca").split(",")
+                        if r.strip()}
 ANOMALY_ALERT_Z = float(env("ANOMALY_ALERT_Z", "3.0"))
 ANOMALY_MIN_DAYS = int(env("ANOMALY_MIN_DAYS", "14"))
 ANOMALY_BASELINE_DAYS = int(env("ANOMALY_BASELINE_DAYS", "28"))
@@ -204,7 +207,7 @@ def add_event(con, kind, severity, a, now, sighting_id, region, detail, outbox):
     con.execute("""INSERT INTO events (ts, hex, sighting_id, type, severity, region, lat, lon, detail)
                    VALUES (?,?,?,?,?,?,?,?,?)""",
                 (now, a["hex"], sighting_id, kind, severity, region, a["lat"], a["lon"], detail))
-    if kind not in ALERT_EVENTS:
+    if kind not in ALERT_EVENTS or region in ALERT_IGNORE_REGIONS:
         return
     if kind != "emergencia" and ALERT_EVENT_REGIONS and region not in ALERT_EVENT_REGIONS:
         return
@@ -371,7 +374,8 @@ def check_anomalies(con, now, outbox):
                        VALUES (?,?,?,?,?,?)""",
                     (now, "", "anomalia", item["level"], reg,
                      f"Índice {item['z']:+.1f} desvios (atual {item['current']} vs média {item['mean']})"))
-        if "anomalia" in ALERT_EVENTS and should_alert(con, reg, now, kind="anomalia", hours=12):
+        if "anomalia" in ALERT_EVENTS and reg not in ALERT_IGNORE_REGIONS \
+                and should_alert(con, reg, now, kind="anomalia", hours=12):
             tops = [c for c in item["categories"] if c["mean"] is not None and c["current"] > c["mean"]][:4]
             det = "\n".join(f"• {c['label']}: {c['current']} (média {c['mean']})" for c in tops)
             msg = (f"📈 Atividade anômala: {reg} — nível {item['level']}\n"

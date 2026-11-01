@@ -80,6 +80,7 @@ add_default BRAZIL_ALERT_SCOPE US "Alerta de entrada no Brasil: US | NATO | FORE
 add_default ALERT_COOLDOWN_HOURS 6
 add_default ALERT_EVENTS emergencia,anomalia "Eventos que vão para o Telegram: emergencia,anomalia,orbita,mudanca_rota,descida_rapida,sinal_perdido"
 add_default ALERT_EVENT_REGIONS "" "Limita alertas de evento (exceto emergência) a estas regiões; vazio = todas"
+add_default ALERT_IGNORE_REGIONS "América do Norte,Alasca" "Regiões cujos eventos e anomalias ficam só no painel (sem Telegram)"
 add_default ANOMALY_ALERT_Z 3.0 "Índice de Atividade Anômala"
 add_default ANOMALY_MIN_DAYS 14
 add_default ANOMALY_BASELINE_DAYS 28
