@@ -34,6 +34,13 @@ CREATE TABLE IF NOT EXISTS region_hourly (
 CREATE TABLE IF NOT EXISTS collected_hours (hour INTEGER PRIMARY KEY, aircraft INTEGER);
 CREATE TABLE IF NOT EXISTS landings (
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, hex TEXT, callsign TEXT, lat REAL, lon REAL);
+CREATE TABLE IF NOT EXISTS ais_ships (
+  mmsi TEXT PRIMARY KEY, name TEXT, type INTEGER, lat REAL, lon REAL, sog REAL, cog REAL, ts INTEGER);
+CREATE TABLE IF NOT EXISTS ais_transits (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, mmsi TEXT, name TEXT, type INTEGER,
+  direction TEXT, lat REAL);
+CREATE TABLE IF NOT EXISTS ais_hourly (
+  hour INTEGER, zone TEXT, ships INTEGER, tankers INTEGER, PRIMARY KEY (hour, zone));
 """
 
 INDEXES = """

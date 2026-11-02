@@ -344,20 +344,32 @@ def record_landing(con, hx, callsign, lat, lon, now, sid):
 def sweep_stale(con, now, outbox):
     """Aeronaves que sumiram: registra pouso provável ou perda de sinal em área sensível."""
     rows = con.execute("""SELECT s.hex, s.sighting_id, s.lat, s.lon, s.alt, s.gs, s.region,
-                                 a.type, a.reg, a.category, a.country, sg.callsign
+                                 a.type, a.reg, a.category, a.country, sg.callsign, sg.n_points
                           FROM state s LEFT JOIN aircraft a ON a.hex=s.hex
                           LEFT JOIN sightings sg ON sg.id=s.sighting_id
                           WHERE s.lost=0 AND s.ts < ? AND s.ts > ?""",
                        (now - 1200, now - 3 * 3600)).fetchall()
-    for hx, sid, lat, lon, alt, gs, region, tp, reg, cat, country, cs in rows:
+    for hx, sid, lat, lon, alt, gs, region, tp, reg, cat, country, cs, npts in rows:
         a = {"hex": hx, "lat": lat, "lon": lon, "alt": alt, "type": tp, "reg": reg,
              "category": cat, "country": country, "callsign": cs}
         if alt is not None and 0 < alt <= 3000 and (gs or 0) < 220:
             record_landing(con, hx, cs, lat, lon, now, sid)
-        elif (alt or 0) >= 15000 and region in SENSITIVE_REGIONS:
+        elif ((alt or 0) >= 15000 and region in SENSITIVE_REGIONS and cat in catalog.HEAVY
+              and (npts or 0) >= 10 and area_has_coverage(con, hx, lat, lon, now)):
             add_event(con, "sinal_perdido", "baixa", a, now, sid, region,
-                      f"Último sinal a {fmt_alt(alt)}; pode ser só falta de cobertura", outbox)
+                      f"Último sinal a {fmt_alt(alt)}; havia cobertura na área (outras aeronaves "
+                      f"seguem sendo captadas por perto)", outbox)
         con.execute("UPDATE state SET lost=1 WHERE hex=?", (hx,))
+
+
+def area_has_coverage(con, hx, lat, lon, now, radius_km=300):
+    """Há receptores na área? Prova: outra aeronave foi captada perto dali nos últimos 10 min."""
+    d = radius_km / 111.0
+    for la, lo in con.execute("""SELECT lat, lon FROM state WHERE hex<>? AND ts>=? AND lat BETWEEN ? AND ?""",
+                              (hx, now - 600, lat - d, lat + d)).fetchall():
+        if geo.haversine_km(lat, lon, la, lo) <= radius_km:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------- tarefas periódicas
@@ -440,7 +452,27 @@ def daily_digest(con, now):
                                       for k, v in evs.items()) or "nenhum"),
              f"Índice de atividade: {idx_txt}",
              f"Entradas no Brasil ({BR_SCOPE}): {br}"]
+    hz = hormuz_summary(con, now)
+    if hz:
+        lines.append(hz)
     return "\n".join(lines)
+
+
+def hormuz_summary(con, now):
+    last = store.meta_get(con, "ais_last_msg")
+    if not last:
+        return None
+    t24 = con.execute("""SELECT COUNT(*), SUM(CASE WHEN type BETWEEN 80 AND 89 THEN 1 ELSE 0 END)
+                         FROM ais_transits WHERE ts>=?""", (now - 86400,)).fetchone()
+    prev = con.execute("SELECT COUNT(*) FROM ais_transits WHERE ts>=? AND ts<?",
+                       (now - 8 * 86400, now - 86400)).fetchone()[0]
+    first = con.execute("SELECT MIN(ts) FROM ais_transits").fetchone()[0]
+    txt = f"Ormuz (AIS): {t24[0]} travessias em 24h ({t24[1] or 0} petroleiros)"
+    if first and now - first >= 8 * 86400:
+        txt += f"; média dos 7 dias anteriores: {prev / 7:.1f}/dia"
+    if now - int(last) > 3600:
+        txt += " ⚠️ dados AIS atrasados"
+    return txt
 
 
 def maybe_digest(con, now):

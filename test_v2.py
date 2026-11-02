@@ -167,14 +167,35 @@ class Flow(unittest.TestCase):
         self.assertEqual(preds[0]["confidence"], "alta")
         self.assertEqual(len(analysis.projection(49.0, 2.0, 90, 420)), 3)
 
-    def test_signal_lost_in_sensitive_region(self):
+    def test_signal_lost_requires_coverage_and_history(self):
         con = new_db()
-        mw.cycle(con, [ac("ae5555", 44.0, 33.0, 90, alt=30000, t="R135")], T0)
-        mw.cycle(con, [], T0 + 1500)
-        ev = con.execute("SELECT type, region FROM events").fetchall()
-        self.assertEqual(ev, [("sinal_perdido", "Mar Negro")])
-        mw.cycle(con, [], T0 + 3000)
-        self.assertEqual(con.execute("SELECT COUNT(*) FROM events").fetchone()[0], 1)
+        t = T0
+        for i in range(12):   # RC-135 com rastro consistente + um vizinho sobre o Mar Negro
+            mw.cycle(con, [ac("ae5555", 44.0, 33.0 + i * 0.05, 90, alt=30000, t="R135"),
+                           ac("ae5556", 44.3, 33.5, 270, alt=28000, t="K35R")], t)
+            t += 90
+        # RC-135 some; o vizinho continua sendo captado => havia cobertura
+        for k in range(16):
+            mw.cycle(con, [ac("ae5556", 44.3, 33.5, 270, alt=28000, t="K35R")], t)
+            t += 90
+        ev = con.execute("SELECT hex, type, region FROM events WHERE type='sinal_perdido'").fetchall()
+        self.assertEqual(ev, [("ae5555", "sinal_perdido", "Mar Negro")])
+
+    def test_signal_lost_ignored_without_coverage(self):
+        con = new_db()
+        t = T0
+        for i in range(12):
+            mw.cycle(con, [ac("ae5555", 44.0, 33.0 + i * 0.05, 90, alt=30000, t="R135")], t)
+            t += 90
+        mw.cycle(con, [], t + 1500)
+        self.assertEqual(con.execute("SELECT COUNT(*) FROM events").fetchone()[0], 0)
+
+    def test_signal_lost_ignored_for_short_contact(self):
+        con = new_db()
+        mw.cycle(con, [ac("ae5555", 44.0, 33.0, 90, alt=30000, t="R135"),
+                       ac("ae5556", 44.3, 33.5, 270, alt=28000, t="K35R")], T0)
+        mw.cycle(con, [ac("ae5556", 44.3, 33.5, 270, alt=28000, t="K35R")], T0 + 1500)
+        self.assertEqual(con.execute("SELECT COUNT(*) FROM events WHERE type='sinal_perdido'").fetchone()[0], 0)
 
 
 class Anomaly(unittest.TestCase):

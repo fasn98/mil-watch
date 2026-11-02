@@ -17,8 +17,9 @@ command -v systemctl >/dev/null || die "systemd não encontrado nesta VM"
 
 if [ "${1:-}" = "--uninstall" ]; then
   say "Removendo serviços (os dados em $APP_DIR/data são mantidos)"
-  systemctl disable --now "$SERVICE" "$SERVICE-dashboard" 2>/dev/null || true
-  rm -f "/etc/systemd/system/$SERVICE.service" "/etc/systemd/system/$SERVICE-dashboard.service"
+  systemctl disable --now "$SERVICE" "$SERVICE-dashboard" "$SERVICE-ais" 2>/dev/null || true
+  rm -f "/etc/systemd/system/$SERVICE.service" "/etc/systemd/system/$SERVICE-dashboard.service" \
+        "/etc/systemd/system/$SERVICE-ais.service"
   systemctl daemon-reload
   say "Removido. Para apagar tudo: rm -rf $APP_DIR && userdel $APP_USER"
   exit 0
@@ -31,13 +32,19 @@ if ! command -v python3 >/dev/null || ! python3 -c 'import sys; sys.exit(sys.ver
   else die "instale python3 (3.9+) manualmente e rode de novo"; fi
 fi
 say "Python: $(python3 --version)"
+if ! python3 -c 'import websockets' 2>/dev/null; then
+  say "Instalando python3-websockets (módulo AIS de Ormuz)"
+  if command -v apt-get >/dev/null; then apt-get install -y -qq python3-websockets >/dev/null 2>&1 || true; fi
+  python3 -c 'import websockets' 2>/dev/null || python3 -m pip install -q --break-system-packages websockets 2>/dev/null || \
+    warn "não consegui instalar websockets; o módulo de Ormuz ficará desligado"
+fi
 
 id "$APP_USER" >/dev/null 2>&1 || useradd --system --home-dir "$APP_DIR" --shell /usr/sbin/nologin "$APP_USER"
 mkdir -p "$APP_DIR/data"
 
 # Backup do banco antes de atualizar (a migração para v2 é automática)
 if [ -f "$APP_DIR/data/milwatch.db" ]; then
-  systemctl stop "$SERVICE" "$SERVICE-dashboard" 2>/dev/null || true
+  systemctl stop "$SERVICE" "$SERVICE-dashboard" "$SERVICE-ais" 2>/dev/null || true
   cp "$APP_DIR/data/milwatch.db" "$APP_DIR/data/milwatch.db.bak-$(date +%Y%m%d-%H%M%S)"
   ls -1t "$APP_DIR"/data/milwatch.db.bak-* 2>/dev/null | tail -n +4 | xargs -r rm -f
   say "Backup do banco feito em $APP_DIR/data/ (mantidos os 3 mais recentes)"
@@ -345,6 +352,13 @@ CREATE TABLE IF NOT EXISTS region_hourly (
 CREATE TABLE IF NOT EXISTS collected_hours (hour INTEGER PRIMARY KEY, aircraft INTEGER);
 CREATE TABLE IF NOT EXISTS landings (
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, hex TEXT, callsign TEXT, lat REAL, lon REAL);
+CREATE TABLE IF NOT EXISTS ais_ships (
+  mmsi TEXT PRIMARY KEY, name TEXT, type INTEGER, lat REAL, lon REAL, sog REAL, cog REAL, ts INTEGER);
+CREATE TABLE IF NOT EXISTS ais_transits (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, mmsi TEXT, name TEXT, type INTEGER,
+  direction TEXT, lat REAL);
+CREATE TABLE IF NOT EXISTS ais_hourly (
+  hour INTEGER, zone TEXT, ships INTEGER, tankers INTEGER, PRIMARY KEY (hour, zone));
 """
 
 INDEXES = """
@@ -1040,20 +1054,32 @@ def record_landing(con, hx, callsign, lat, lon, now, sid):
 def sweep_stale(con, now, outbox):
     """Aeronaves que sumiram: registra pouso provável ou perda de sinal em área sensível."""
     rows = con.execute("""SELECT s.hex, s.sighting_id, s.lat, s.lon, s.alt, s.gs, s.region,
-                                 a.type, a.reg, a.category, a.country, sg.callsign
+                                 a.type, a.reg, a.category, a.country, sg.callsign, sg.n_points
                           FROM state s LEFT JOIN aircraft a ON a.hex=s.hex
                           LEFT JOIN sightings sg ON sg.id=s.sighting_id
                           WHERE s.lost=0 AND s.ts < ? AND s.ts > ?""",
                        (now - 1200, now - 3 * 3600)).fetchall()
-    for hx, sid, lat, lon, alt, gs, region, tp, reg, cat, country, cs in rows:
+    for hx, sid, lat, lon, alt, gs, region, tp, reg, cat, country, cs, npts in rows:
         a = {"hex": hx, "lat": lat, "lon": lon, "alt": alt, "type": tp, "reg": reg,
              "category": cat, "country": country, "callsign": cs}
         if alt is not None and 0 < alt <= 3000 and (gs or 0) < 220:
             record_landing(con, hx, cs, lat, lon, now, sid)
-        elif (alt or 0) >= 15000 and region in SENSITIVE_REGIONS:
+        elif ((alt or 0) >= 15000 and region in SENSITIVE_REGIONS and cat in catalog.HEAVY
+              and (npts or 0) >= 10 and area_has_coverage(con, hx, lat, lon, now)):
             add_event(con, "sinal_perdido", "baixa", a, now, sid, region,
-                      f"Último sinal a {fmt_alt(alt)}; pode ser só falta de cobertura", outbox)
+                      f"Último sinal a {fmt_alt(alt)}; havia cobertura na área (outras aeronaves "
+                      f"seguem sendo captadas por perto)", outbox)
         con.execute("UPDATE state SET lost=1 WHERE hex=?", (hx,))
+
+
+def area_has_coverage(con, hx, lat, lon, now, radius_km=300):
+    """Há receptores na área? Prova: outra aeronave foi captada perto dali nos últimos 10 min."""
+    d = radius_km / 111.0
+    for la, lo in con.execute("""SELECT lat, lon FROM state WHERE hex<>? AND ts>=? AND lat BETWEEN ? AND ?""",
+                              (hx, now - 600, lat - d, lat + d)).fetchall():
+        if geo.haversine_km(lat, lon, la, lo) <= radius_km:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------- tarefas periódicas
@@ -1136,7 +1162,27 @@ def daily_digest(con, now):
                                       for k, v in evs.items()) or "nenhum"),
              f"Índice de atividade: {idx_txt}",
              f"Entradas no Brasil ({BR_SCOPE}): {br}"]
+    hz = hormuz_summary(con, now)
+    if hz:
+        lines.append(hz)
     return "\n".join(lines)
+
+
+def hormuz_summary(con, now):
+    last = store.meta_get(con, "ais_last_msg")
+    if not last:
+        return None
+    t24 = con.execute("""SELECT COUNT(*), SUM(CASE WHEN type BETWEEN 80 AND 89 THEN 1 ELSE 0 END)
+                         FROM ais_transits WHERE ts>=?""", (now - 86400,)).fetchone()
+    prev = con.execute("SELECT COUNT(*) FROM ais_transits WHERE ts>=? AND ts<?",
+                       (now - 8 * 86400, now - 86400)).fetchone()[0]
+    first = con.execute("SELECT MIN(ts) FROM ais_transits").fetchone()[0]
+    txt = f"Ormuz (AIS): {t24[0]} travessias em 24h ({t24[1] or 0} petroleiros)"
+    if first and now - first >= 8 * 86400:
+        txt += f"; média dos 7 dias anteriores: {prev / 7:.1f}/dia"
+    if now - int(last) > 3600:
+        txt += " ⚠️ dados AIS atrasados"
+    return txt
 
 
 def maybe_digest(con, now):
@@ -1444,7 +1490,45 @@ def api_stats(q):
         }
 
 
-ROUTES = {"/api/meta": api_meta, "/api/live": api_live, "/api/aircraft": api_aircraft,
+def api_hormuz(q):
+    from datetime import datetime
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(os.getenv("TIMEZONE", "America/Sao_Paulo"))
+    except Exception:
+        tz = None
+    days = max(1, min(int(q.get("days", 30)), 120))
+    now = int(time.time())
+    with db() as con:
+        last = con.execute("SELECT v FROM meta WHERE k='ais_last_msg'").fetchone()
+        tr = rows(con, "SELECT ts, mmsi, name, type, direction FROM ais_transits WHERE ts>=? ORDER BY ts DESC",
+                  (now - days * 86400,))
+        hourly = con.execute("SELECT hour, zone, ships, tankers FROM ais_hourly WHERE hour>=?",
+                             (now - days * 86400,)).fetchall()
+        ships = rows(con, "SELECT mmsi, name, type, lat, lon, sog, cog, ts FROM ais_ships WHERE ts>=?",
+                     (now - 1800,))
+    day = lambda ts: datetime.fromtimestamp(ts, tz).strftime("%Y-%m-%d")
+    daily = {}
+    for t in tr:
+        d = daily.setdefault(day(t["ts"]), {"entrada": 0, "saida": 0, "tankers": 0, "golfo_max": 0})
+        d[t["direction"]] += 1
+        if t["type"] is not None and 80 <= t["type"] <= 89:
+            d["tankers"] += 1
+    for h, zone, n, _ in hourly:
+        if zone == "golfo":
+            d = daily.setdefault(day(h), {"entrada": 0, "saida": 0, "tankers": 0, "golfo_max": 0})
+            d["golfo_max"] = max(d["golfo_max"], n)
+    last24 = [t for t in tr if t["ts"] >= now - 86400]
+    prev7 = [t for t in tr if now - 8 * 86400 <= t["ts"] < now - 86400]
+    return {"configured": bool(os.getenv("AISSTREAM_API_KEY", "").strip()),
+            "last_msg": int(last[0]) if last else None,
+            "t24": len(last24), "t24_tankers": sum(1 for t in last24 if t["type"] and 80 <= t["type"] <= 89),
+            "avg7": round(len(prev7) / 7, 1) if prev7 else None,
+            "daily": [{"day": k, **v} for k, v in sorted(daily.items(), reverse=True)],
+            "recent": tr[:40], "ships": ships}
+
+
+ROUTES = {"/api/hormuz": api_hormuz, "/api/meta": api_meta, "/api/live": api_live, "/api/aircraft": api_aircraft,
           "/api/regions": api_regions, "/api/events": api_events, "/api/sightings": api_sightings,
           "/api/tracks": api_tracks, "/api/stats": api_stats}
 
@@ -1487,7 +1571,7 @@ footer{color:var(--mut);font-size:12px;padding:0 20px 20px;max-width:1500px;marg
 </style></head><body>
 <header><h1>mil-watch</h1>
 <nav id="tabs"><button data-t="live" class="on">Agora</button><button data-t="regions">Regiões</button>
-<button data-t="events">Eventos</button><button data-t="history">Histórico</button></nav>
+<button data-t="events">Eventos</button><button data-t="history">Histórico</button><button data-t="hormuz">Ormuz</button></nav>
 <div class="filters"><select id="fRegion"><option value="">Todas as regiões</option></select>
 <select id="fCat"><option value="">Todas as categorias</option></select>
 <label class="ck"><input type="checkbox" id="fNato">só OTAN</label>
@@ -1634,7 +1718,31 @@ async function loadHistory(){
   if(lines[r.dataset.id])map.fitBounds(lines[r.dataset.id].getBounds(),{padding:[30,30],maxZoom:7})});
 }
 
-const LOAD={live:loadLive,regions:loadRegions,events:loadEvents,history:loadHistory};
+// ---------------- Ormuz (AIS)
+const SC=t=>t==null?"desconhecido":t===35?"militar":t>=80&&t<=89?"petroleiro":t>=70&&t<=79?"carga":t>=60&&t<=69?"passageiros":"outro";
+const SCC={petroleiro:"#ffb547",carga:"#4fb3ff",passageiros:"#9be564",militar:"#ff5a5a",outro:"#8b96a3",desconhecido:"#56606b"};
+async function loadHormuz(){
+ $("mapTitle").textContent="Navios na região do Estreito de Ormuz (AIS, últimos 30 min)";selHex=null;
+ const d=await j("api/hormuz?days=30");
+ if(map){layer.clearLayers();overlay.clearLayers();
+  d.ships.forEach(s=>L.circleMarker([s.lat,s.lon],{radius:4,color:SCC[SC(s.type)],weight:1,fillOpacity:.8})
+   .bindTooltip(`${esc(s.name||s.mmsi)} · ${SC(s.type)} · ${s.sog??"–"} nós`).addTo(layer));
+  L.polyline([[25.9,56.0],[25.9,56.45],[27.1,56.45]],{color:"#ffffff",weight:1,dashArray:"4 4",opacity:.6}).bindTooltip("Linha de travessia do estreito").addTo(layer);
+  if(fitNext){fitNext=false;map.fitBounds([[24.0,53.5],[27.8,59.0]])}}
+ const ago=d.last_msg?Math.round((Date.now()/1000-d.last_msg)/60):null;
+ let status=!d.configured?'<p class="note" style="color:var(--warn)">Módulo desligado: falta AISSTREAM_API_KEY no .env da VM (chave grátis em aisstream.io).</p>':
+  ago==null?'<p class="note">Aguardando os primeiros dados AIS…</p>':ago>15?`<p class="note" style="color:var(--warn)">Último dado AIS há ${ago} min: conexão ou cobertura com problema.</p>`:`<p class="note">Último dado AIS há ${ago} min.</p>`;
+ $("sideTitle").textContent="Tráfego no estreito";
+ $("side").innerHTML=`<div class="pad"><dl><dt>Travessias 24 h</dt><dd><b>${d.t24}</b></dd><dt>Petroleiros 24 h</dt><dd>${d.t24_tankers}</dd>
+ <dt>Média diária (7 dias antes)</dt><dd>${d.avg7??"–"}</dd><dt>Navios no mapa agora</dt><dd>${d.ships.length}</dd></dl>${status}
+ <p class="note">Travessia = navio que cruzou a linha do estreito (entrada ou saída do Golfo Pérsico). Conta só quem transmite AIS e é captado por receptores em terra; em zona de conflito muitos navios desligam o AIS, e navios de guerra quase nunca aparecem. Use como tendência, não como número absoluto.</p></div>`;
+ $("tblTitle").textContent="Travessias por dia (horário de Brasília)";
+ const mx=Math.max(1,...d.daily.map(x=>x.entrada+x.saida));
+ table(["Dia","Entradas","Saídas","Petroleiros","Navios no Golfo (pico/hora)",""],d.daily.map(x=>`<tr><td>${x.day.split("-").reverse().join("/")}</td><td>${x.entrada}</td><td>${x.saida}</td><td>${x.tankers}</td><td>${x.golfo_max||"–"}</td><td style="width:35%"><div class="bar" style="margin:0"><i style="width:${Math.round((x.entrada+x.saida)/mx*100)}%"></i></div></td></tr>`),
+  d.configured?"Ainda sem travessias registradas.":"Módulo AIS desligado.");
+}
+
+const LOAD={live:loadLive,regions:loadRegions,events:loadEvents,history:loadHistory,hormuz:loadHormuz};
 async function refresh(){try{await kpis();await LOAD[tab]()}catch(e){$("tbody").innerHTML=`<tr><td class="mut">Erro ao carregar: ${esc(e.message)}</td></tr>`}}
 function setTab(t){tab=t;document.querySelectorAll("#tabs button").forEach(b=>b.classList.toggle("on",b.dataset.t===t));
  $("wBr").style.display=t==="history"?"":"none";$("fDays").style.display=(t==="events"||t==="history")?"":"none";
@@ -1710,6 +1818,218 @@ def main():
 if __name__ == "__main__":
     main()
 MILWATCH_EOF_DASHBOARD_PY
+say "Gravando $APP_DIR/ais_watch.py"
+cat > "$APP_DIR/ais_watch.py" <<'MILWATCH_EOF_AIS_WATCH_PY'
+"""Tráfego de navios no Estreito de Ormuz via AIS público (aisstream.io).
+
+Conta travessias do estreito (entrada/saída do Golfo Pérsico) e navios presentes por hora.
+É o termômetro mais factual da crise: quando o tráfego cai, a tensão subiu.
+
+Limitações: depende de receptores AIS em terra na região; navios podem desligar o AIS
+(comum em zona de conflito); navios de guerra quase nunca transmitem.
+
+Requer: AISSTREAM_API_KEY no .env (chave gratuita em https://aisstream.io) e o pacote
+`websockets` (python3-websockets no Ubuntu/Debian).
+"""
+import asyncio
+import json
+import logging
+import os
+import time
+
+import geo
+import store
+
+
+def load_env(path=".env"):
+    if os.path.exists(path):
+        for line in open(path, encoding="utf-8"):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+
+
+load_env()
+API_KEY = os.getenv("AISSTREAM_API_KEY", "").strip()
+DB_PATH = os.getenv("DB_PATH", "data/milwatch.db")
+URL = os.getenv("AISSTREAM_URL", "wss://stream.aisstream.io/v0/stream")
+# Golfo Pérsico + Golfo de Omã: lat_min, lon_min, lat_max, lon_max
+BBOX = [float(x) for x in os.getenv("AIS_BBOX", "22.0,47.5,30.6,60.5").split(",")]
+STRAIT_CENTER = (26.45, 56.40)
+FLUSH_SECONDS = 60
+
+SHIP_TYPES = {"tanker": range(80, 90), "cargo": range(70, 80), "passenger": range(60, 70)}
+
+
+def side_of(lat, lon):
+    """Dentro do Golfo Pérsico ou fora (Golfo de Omã/mar aberto).
+
+    A península de Musandam separa os dois: a oeste de 56,0°E é Golfo; entre 56,0° e 56,45°E,
+    só é Golfo ao norte de 25,9°N (o estreito em si). Fujairah (56,35°E; 25,1°N) fica fora.
+    """
+    if lon < 56.0 or (lon < 56.45 and lat >= 25.9):
+        return "golfo"
+    return "oma"
+
+
+def ship_class(t):
+    if t is None:
+        return "desconhecido"
+    if t == 35:
+        return "militar"
+    for name, rng in SHIP_TYPES.items():
+        if t in rng:
+            return name
+    return "outro"
+
+
+class Tracker:
+    """Estado em memória; grava no banco a cada minuto. Sem rede: fácil de testar."""
+
+    def __init__(self):
+        self.ships = {}          # mmsi -> dict(name, type, lat, lon, sog, cog, ts, side)
+        self.transits = []       # pendentes de gravação
+        self.hour = None
+        self.hour_seen = {"golfo": set(), "oma": set()}
+        self.last_msg = 0
+
+    def on_message(self, msg, now=None):
+        now = now or int(time.time())
+        self.last_msg = now
+        mtype = msg.get("MessageType")
+        body = (msg.get("Message") or {}).get(mtype) or {}
+        meta = msg.get("MetaData") or {}
+        mmsi = str(body.get("UserID") or meta.get("MMSI") or "")
+        if not mmsi:
+            return None
+        s = self.ships.setdefault(mmsi, {"name": "", "type": None, "lat": None, "lon": None,
+                                         "sog": None, "cog": None, "ts": 0, "side": None})
+        if mtype == "ShipStaticData" and (body.get("Name") or "").strip():
+            s["name"] = body["Name"].strip()          # nome oficial (dados estáticos) tem prioridade
+        elif not s["name"] and (meta.get("ShipName") or "").strip():
+            s["name"] = meta["ShipName"].strip()
+        if mtype == "ShipStaticData":
+            if isinstance(body.get("Type"), int) and body["Type"] > 0:
+                s["type"] = body["Type"]
+            return None
+        if mtype not in ("PositionReport", "StandardClassBPositionReport", "ExtendedClassBPositionReport"):
+            return None
+        lat, lon = body.get("Latitude"), body.get("Longitude")
+        if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)) or abs(lat) > 90 or abs(lon) > 180:
+            return None
+        return self.on_position(mmsi, lat, lon, body.get("Sog"), body.get("Cog"), now)
+
+    def on_position(self, mmsi, lat, lon, sog, cog, now):
+        s = self.ships[mmsi]
+        self._roll_hour(now)
+        side = side_of(lat, lon)
+        transit = None
+        if (s["side"] and s["side"] != side and now - s["ts"] <= 3 * 3600
+                and geo.haversine_km(lat, lon, *STRAIT_CENTER) <= 250):
+            direction = "entrada" if side == "golfo" else "saida"
+            transit = {"ts": now, "mmsi": mmsi, "name": s["name"], "type": s["type"],
+                       "direction": direction, "lat": lat}
+            self.transits.append(transit)
+        s.update(lat=lat, lon=lon, sog=sog, cog=cog, ts=now, side=side)
+        self.hour_seen[side].add(mmsi)
+        return transit
+
+    def _roll_hour(self, now):
+        h = now // 3600 * 3600
+        if self.hour is None:
+            self.hour = h
+        elif h != self.hour:
+            self.pending_hour = (self.hour, {z: set(v) for z, v in self.hour_seen.items()})
+            self.hour = h
+            self.hour_seen = {"golfo": set(), "oma": set()}
+
+    def flush(self, con, now=None):
+        now = now or int(time.time())
+        rows = [(m, s["name"], s["type"], s["lat"], s["lon"], s["sog"], s["cog"], s["ts"])
+                for m, s in self.ships.items() if s["lat"] is not None and s["ts"] >= now - 120]
+        con.executemany("""INSERT INTO ais_ships (mmsi, name, type, lat, lon, sog, cog, ts)
+                           VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(mmsi) DO UPDATE SET
+                           name=COALESCE(NULLIF(excluded.name,''), name), type=COALESCE(excluded.type, type),
+                           lat=excluded.lat, lon=excluded.lon, sog=excluded.sog, cog=excluded.cog,
+                           ts=excluded.ts""", rows)
+        con.executemany("""INSERT INTO ais_transits (ts, mmsi, name, type, direction, lat)
+                           VALUES (:ts,:mmsi,:name,:type,:direction,:lat)""", self.transits)
+        n_tr = len(self.transits)
+        self.transits = []
+        ph = getattr(self, "pending_hour", None)
+        if ph:
+            hour, seen = ph
+            for zone, ms in seen.items():
+                tankers = sum(1 for m in ms if ship_class(self.ships.get(m, {}).get("type")) == "tanker")
+                con.execute("INSERT OR REPLACE INTO ais_hourly VALUES (?,?,?,?)", (hour, zone, len(ms), tankers))
+            self.pending_hour = None
+        store.meta_set(con, "ais_last_msg", self.last_msg)
+        con.execute("DELETE FROM ais_ships WHERE ts < ?", (now - 7 * 86400,))
+        # navios que ficaram horas sem posição perdem o "lado" (evita travessia falsa ao reaparecer)
+        for s in self.ships.values():
+            if s["ts"] < now - 3 * 3600:
+                s["side"] = None
+        con.commit()
+        return n_tr
+
+
+async def run(tracker, con):
+    import websockets
+    sub = {"APIKey": API_KEY, "BoundingBoxes": [[[BBOX[0], BBOX[1]], [BBOX[2], BBOX[3]]]],
+           "FilterMessageTypes": ["PositionReport", "StandardClassBPositionReport",
+                                  "ExtendedClassBPositionReport", "ShipStaticData"]}
+    backoff = 5
+    last_flush = time.time()
+    while True:
+        try:
+            async with websockets.connect(URL, compression="deflate", ping_interval=30,
+                                          max_size=2 ** 22, open_timeout=30) as ws:
+                await ws.send(json.dumps(sub))
+                logging.info("AIS conectado; área %s", BBOX)
+                backoff = 5
+                while True:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=180)
+                    try:
+                        msg = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if "error" in msg:
+                        logging.error("aisstream recusou: %s", msg["error"])
+                        await asyncio.sleep(300)
+                        break
+                    tr = tracker.on_message(msg)
+                    if tr:
+                        logging.info("Travessia: %s %s (%s)", tr["direction"], tr["name"] or tr["mmsi"],
+                                     ship_class(tr["type"]))
+                    if time.time() - last_flush >= FLUSH_SECONDS:
+                        tracker.flush(con)
+                        last_flush = time.time()
+        except asyncio.TimeoutError:
+            logging.warning("AIS: 3 min sem mensagens; reconectando")
+        except Exception as e:
+            logging.warning("AIS: conexão caiu (%s); nova tentativa em %ss", e, backoff)
+        try:
+            tracker.flush(con)
+        except Exception as e:
+            logging.error("AIS: falha ao gravar: %s", e)
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 300)
+
+
+def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    if not API_KEY:
+        logging.info("AISSTREAM_API_KEY vazio: módulo de Ormuz desligado. "
+                     "Crie uma chave grátis em https://aisstream.io e coloque no .env.")
+        return
+    con = store.connect(DB_PATH)
+    asyncio.run(run(Tracker(), con))
+
+
+if __name__ == "__main__":
+    main()
+MILWATCH_EOF_AIS_WATCH_PY
 python3 -m py_compile "$APP_DIR"/*.py || die "falha ao validar o programa"
 rm -rf "$APP_DIR/__pycache__"
 
@@ -1744,6 +2064,7 @@ add_default ALERT_IGNORE_REGIONS "América do Norte,Alasca" "Regiões cujos even
 add_default ANOMALY_ALERT_Z 3.0 "Índice de Atividade Anômala"
 add_default ANOMALY_MIN_DAYS 14
 add_default ANOMALY_BASELINE_DAYS 28
+add_default AISSTREAM_API_KEY "" "Tráfego de navios em Ormuz: chave grátis em https://aisstream.io (vazio = módulo desligado)"
 add_default DIGEST_HOUR 8 "Resumo diário no Telegram (hora local; -1 desliga)"
 add_default TIMEZONE America/Sao_Paulo
 add_default REPORT_EVERY_DAYS 7
@@ -1765,7 +2086,7 @@ else
 fi
 
 # ---------------------------------------------------------------- serviços
-unit() {  # nome, descrição, script, restart
+unit() {  # nome, descrição, script, segundos, [política de restart]
 cat > "/etc/systemd/system/$1.service" <<EOF
 [Unit]
 Description=$2
@@ -1778,7 +2099,7 @@ User=$APP_USER
 Group=$APP_USER
 WorkingDirectory=$APP_DIR
 ExecStart=$(command -v python3) -u $APP_DIR/$3
-Restart=always
+Restart=${5:-always}
 RestartSec=$4
 NoNewPrivileges=true
 ProtectSystem=strict
@@ -1793,14 +2114,15 @@ EOF
 say "Criando serviços"
 unit "$SERVICE" "mil-watch - coletor global de aeronaves militares" mil_watch.py 30
 unit "$SERVICE-dashboard" "mil-watch - painel web" dashboard.py 10
+unit "$SERVICE-ais" "mil-watch - tráfego de navios em Ormuz (AIS)" ais_watch.py 60 on-failure
 if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
   ufw allow "$DASH_PORT/tcp" >/dev/null && say "Porta $DASH_PORT liberada no ufw"
 fi
 systemctl daemon-reload
-systemctl enable "$SERVICE" "$SERVICE-dashboard" >/dev/null 2>&1
+systemctl enable "$SERVICE" "$SERVICE-dashboard" "$SERVICE-ais" >/dev/null 2>&1
 systemctl restart "$SERVICE"
 sleep 4
-systemctl restart "$SERVICE-dashboard"
+systemctl restart "$SERVICE-dashboard" "$SERVICE-ais"
 sleep 3
 
 systemctl is-active --quiet "$SERVICE" || { journalctl -u "$SERVICE" -n 40 --no-pager; die "o coletor não subiu; veja o log acima"; }
@@ -1820,6 +2142,7 @@ cat <<EOF
 Pronto. Deve chegar no Telegram: "🟢 mil-watch-br v2 iniciado: monitoramento global ativo".
   Coletor ao vivo:  journalctl -u $SERVICE -f
   Painel ao vivo:   journalctl -u $SERVICE-dashboard -f
+  Ormuz (AIS):      journalctl -u $SERVICE-ais -f   (precisa de AISSTREAM_API_KEY no .env)
   Configuração:     nano $APP_DIR/.env   (depois: systemctl restart $SERVICE $SERVICE-dashboard)
   Banco de dados:   $APP_DIR/data/milwatch.db  (backup anterior ao lado)
 EOF

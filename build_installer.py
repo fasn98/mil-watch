@@ -2,7 +2,7 @@
 import os
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-FILES = ["geo.py", "catalog.py", "store.py", "analysis.py", "mil_watch.py", "dashboard.py"]
+FILES = ["geo.py", "catalog.py", "store.py", "analysis.py", "mil_watch.py", "dashboard.py", "ais_watch.py"]
 
 HEAD = r'''#!/usr/bin/env bash
 # Instalador do mil-watch v2 (coleta global + painel) para VPS Linux com systemd.
@@ -23,8 +23,9 @@ command -v systemctl >/dev/null || die "systemd não encontrado nesta VM"
 
 if [ "${1:-}" = "--uninstall" ]; then
   say "Removendo serviços (os dados em $APP_DIR/data são mantidos)"
-  systemctl disable --now "$SERVICE" "$SERVICE-dashboard" 2>/dev/null || true
-  rm -f "/etc/systemd/system/$SERVICE.service" "/etc/systemd/system/$SERVICE-dashboard.service"
+  systemctl disable --now "$SERVICE" "$SERVICE-dashboard" "$SERVICE-ais" 2>/dev/null || true
+  rm -f "/etc/systemd/system/$SERVICE.service" "/etc/systemd/system/$SERVICE-dashboard.service" \
+        "/etc/systemd/system/$SERVICE-ais.service"
   systemctl daemon-reload
   say "Removido. Para apagar tudo: rm -rf $APP_DIR && userdel $APP_USER"
   exit 0
@@ -37,13 +38,19 @@ if ! command -v python3 >/dev/null || ! python3 -c 'import sys; sys.exit(sys.ver
   else die "instale python3 (3.9+) manualmente e rode de novo"; fi
 fi
 say "Python: $(python3 --version)"
+if ! python3 -c 'import websockets' 2>/dev/null; then
+  say "Instalando python3-websockets (módulo AIS de Ormuz)"
+  if command -v apt-get >/dev/null; then apt-get install -y -qq python3-websockets >/dev/null 2>&1 || true; fi
+  python3 -c 'import websockets' 2>/dev/null || python3 -m pip install -q --break-system-packages websockets 2>/dev/null || \
+    warn "não consegui instalar websockets; o módulo de Ormuz ficará desligado"
+fi
 
 id "$APP_USER" >/dev/null 2>&1 || useradd --system --home-dir "$APP_DIR" --shell /usr/sbin/nologin "$APP_USER"
 mkdir -p "$APP_DIR/data"
 
 # Backup do banco antes de atualizar (a migração para v2 é automática)
 if [ -f "$APP_DIR/data/milwatch.db" ]; then
-  systemctl stop "$SERVICE" "$SERVICE-dashboard" 2>/dev/null || true
+  systemctl stop "$SERVICE" "$SERVICE-dashboard" "$SERVICE-ais" 2>/dev/null || true
   cp "$APP_DIR/data/milwatch.db" "$APP_DIR/data/milwatch.db.bak-$(date +%Y%m%d-%H%M%S)"
   ls -1t "$APP_DIR"/data/milwatch.db.bak-* 2>/dev/null | tail -n +4 | xargs -r rm -f
   say "Backup do banco feito em $APP_DIR/data/ (mantidos os 3 mais recentes)"
@@ -84,6 +91,7 @@ add_default ALERT_IGNORE_REGIONS "América do Norte,Alasca" "Regiões cujos even
 add_default ANOMALY_ALERT_Z 3.0 "Índice de Atividade Anômala"
 add_default ANOMALY_MIN_DAYS 14
 add_default ANOMALY_BASELINE_DAYS 28
+add_default AISSTREAM_API_KEY "" "Tráfego de navios em Ormuz: chave grátis em https://aisstream.io (vazio = módulo desligado)"
 add_default DIGEST_HOUR 8 "Resumo diário no Telegram (hora local; -1 desliga)"
 add_default TIMEZONE America/Sao_Paulo
 add_default REPORT_EVERY_DAYS 7
@@ -105,7 +113,7 @@ else
 fi
 
 # ---------------------------------------------------------------- serviços
-unit() {  # nome, descrição, script, restart
+unit() {  # nome, descrição, script, segundos, [política de restart]
 cat > "/etc/systemd/system/$1.service" <<EOF
 [Unit]
 Description=$2
@@ -118,7 +126,7 @@ User=$APP_USER
 Group=$APP_USER
 WorkingDirectory=$APP_DIR
 ExecStart=$(command -v python3) -u $APP_DIR/$3
-Restart=always
+Restart=${5:-always}
 RestartSec=$4
 NoNewPrivileges=true
 ProtectSystem=strict
@@ -133,14 +141,15 @@ EOF
 say "Criando serviços"
 unit "$SERVICE" "mil-watch - coletor global de aeronaves militares" mil_watch.py 30
 unit "$SERVICE-dashboard" "mil-watch - painel web" dashboard.py 10
+unit "$SERVICE-ais" "mil-watch - tráfego de navios em Ormuz (AIS)" ais_watch.py 60 on-failure
 if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
   ufw allow "$DASH_PORT/tcp" >/dev/null && say "Porta $DASH_PORT liberada no ufw"
 fi
 systemctl daemon-reload
-systemctl enable "$SERVICE" "$SERVICE-dashboard" >/dev/null 2>&1
+systemctl enable "$SERVICE" "$SERVICE-dashboard" "$SERVICE-ais" >/dev/null 2>&1
 systemctl restart "$SERVICE"
 sleep 4
-systemctl restart "$SERVICE-dashboard"
+systemctl restart "$SERVICE-dashboard" "$SERVICE-ais"
 sleep 3
 
 systemctl is-active --quiet "$SERVICE" || { journalctl -u "$SERVICE" -n 40 --no-pager; die "o coletor não subiu; veja o log acima"; }
@@ -160,6 +169,7 @@ cat <<EOF
 Pronto. Deve chegar no Telegram: "🟢 mil-watch-br v2 iniciado: monitoramento global ativo".
   Coletor ao vivo:  journalctl -u $SERVICE -f
   Painel ao vivo:   journalctl -u $SERVICE-dashboard -f
+  Ormuz (AIS):      journalctl -u $SERVICE-ais -f   (precisa de AISSTREAM_API_KEY no .env)
   Configuração:     nano $APP_DIR/.env   (depois: systemctl restart $SERVICE $SERVICE-dashboard)
   Banco de dados:   $APP_DIR/data/milwatch.db  (backup anterior ao lado)
 EOF

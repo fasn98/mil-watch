@@ -224,7 +224,45 @@ def api_stats(q):
         }
 
 
-ROUTES = {"/api/meta": api_meta, "/api/live": api_live, "/api/aircraft": api_aircraft,
+def api_hormuz(q):
+    from datetime import datetime
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(os.getenv("TIMEZONE", "America/Sao_Paulo"))
+    except Exception:
+        tz = None
+    days = max(1, min(int(q.get("days", 30)), 120))
+    now = int(time.time())
+    with db() as con:
+        last = con.execute("SELECT v FROM meta WHERE k='ais_last_msg'").fetchone()
+        tr = rows(con, "SELECT ts, mmsi, name, type, direction FROM ais_transits WHERE ts>=? ORDER BY ts DESC",
+                  (now - days * 86400,))
+        hourly = con.execute("SELECT hour, zone, ships, tankers FROM ais_hourly WHERE hour>=?",
+                             (now - days * 86400,)).fetchall()
+        ships = rows(con, "SELECT mmsi, name, type, lat, lon, sog, cog, ts FROM ais_ships WHERE ts>=?",
+                     (now - 1800,))
+    day = lambda ts: datetime.fromtimestamp(ts, tz).strftime("%Y-%m-%d")
+    daily = {}
+    for t in tr:
+        d = daily.setdefault(day(t["ts"]), {"entrada": 0, "saida": 0, "tankers": 0, "golfo_max": 0})
+        d[t["direction"]] += 1
+        if t["type"] is not None and 80 <= t["type"] <= 89:
+            d["tankers"] += 1
+    for h, zone, n, _ in hourly:
+        if zone == "golfo":
+            d = daily.setdefault(day(h), {"entrada": 0, "saida": 0, "tankers": 0, "golfo_max": 0})
+            d["golfo_max"] = max(d["golfo_max"], n)
+    last24 = [t for t in tr if t["ts"] >= now - 86400]
+    prev7 = [t for t in tr if now - 8 * 86400 <= t["ts"] < now - 86400]
+    return {"configured": bool(os.getenv("AISSTREAM_API_KEY", "").strip()),
+            "last_msg": int(last[0]) if last else None,
+            "t24": len(last24), "t24_tankers": sum(1 for t in last24 if t["type"] and 80 <= t["type"] <= 89),
+            "avg7": round(len(prev7) / 7, 1) if prev7 else None,
+            "daily": [{"day": k, **v} for k, v in sorted(daily.items(), reverse=True)],
+            "recent": tr[:40], "ships": ships}
+
+
+ROUTES = {"/api/hormuz": api_hormuz, "/api/meta": api_meta, "/api/live": api_live, "/api/aircraft": api_aircraft,
           "/api/regions": api_regions, "/api/events": api_events, "/api/sightings": api_sightings,
           "/api/tracks": api_tracks, "/api/stats": api_stats}
 
@@ -267,7 +305,7 @@ footer{color:var(--mut);font-size:12px;padding:0 20px 20px;max-width:1500px;marg
 </style></head><body>
 <header><h1>mil-watch</h1>
 <nav id="tabs"><button data-t="live" class="on">Agora</button><button data-t="regions">Regiões</button>
-<button data-t="events">Eventos</button><button data-t="history">Histórico</button></nav>
+<button data-t="events">Eventos</button><button data-t="history">Histórico</button><button data-t="hormuz">Ormuz</button></nav>
 <div class="filters"><select id="fRegion"><option value="">Todas as regiões</option></select>
 <select id="fCat"><option value="">Todas as categorias</option></select>
 <label class="ck"><input type="checkbox" id="fNato">só OTAN</label>
@@ -414,7 +452,31 @@ async function loadHistory(){
   if(lines[r.dataset.id])map.fitBounds(lines[r.dataset.id].getBounds(),{padding:[30,30],maxZoom:7})});
 }
 
-const LOAD={live:loadLive,regions:loadRegions,events:loadEvents,history:loadHistory};
+// ---------------- Ormuz (AIS)
+const SC=t=>t==null?"desconhecido":t===35?"militar":t>=80&&t<=89?"petroleiro":t>=70&&t<=79?"carga":t>=60&&t<=69?"passageiros":"outro";
+const SCC={petroleiro:"#ffb547",carga:"#4fb3ff",passageiros:"#9be564",militar:"#ff5a5a",outro:"#8b96a3",desconhecido:"#56606b"};
+async function loadHormuz(){
+ $("mapTitle").textContent="Navios na região do Estreito de Ormuz (AIS, últimos 30 min)";selHex=null;
+ const d=await j("api/hormuz?days=30");
+ if(map){layer.clearLayers();overlay.clearLayers();
+  d.ships.forEach(s=>L.circleMarker([s.lat,s.lon],{radius:4,color:SCC[SC(s.type)],weight:1,fillOpacity:.8})
+   .bindTooltip(`${esc(s.name||s.mmsi)} · ${SC(s.type)} · ${s.sog??"–"} nós`).addTo(layer));
+  L.polyline([[25.9,56.0],[25.9,56.45],[27.1,56.45]],{color:"#ffffff",weight:1,dashArray:"4 4",opacity:.6}).bindTooltip("Linha de travessia do estreito").addTo(layer);
+  if(fitNext){fitNext=false;map.fitBounds([[24.0,53.5],[27.8,59.0]])}}
+ const ago=d.last_msg?Math.round((Date.now()/1000-d.last_msg)/60):null;
+ let status=!d.configured?'<p class="note" style="color:var(--warn)">Módulo desligado: falta AISSTREAM_API_KEY no .env da VM (chave grátis em aisstream.io).</p>':
+  ago==null?'<p class="note">Aguardando os primeiros dados AIS…</p>':ago>15?`<p class="note" style="color:var(--warn)">Último dado AIS há ${ago} min: conexão ou cobertura com problema.</p>`:`<p class="note">Último dado AIS há ${ago} min.</p>`;
+ $("sideTitle").textContent="Tráfego no estreito";
+ $("side").innerHTML=`<div class="pad"><dl><dt>Travessias 24 h</dt><dd><b>${d.t24}</b></dd><dt>Petroleiros 24 h</dt><dd>${d.t24_tankers}</dd>
+ <dt>Média diária (7 dias antes)</dt><dd>${d.avg7??"–"}</dd><dt>Navios no mapa agora</dt><dd>${d.ships.length}</dd></dl>${status}
+ <p class="note">Travessia = navio que cruzou a linha do estreito (entrada ou saída do Golfo Pérsico). Conta só quem transmite AIS e é captado por receptores em terra; em zona de conflito muitos navios desligam o AIS, e navios de guerra quase nunca aparecem. Use como tendência, não como número absoluto.</p></div>`;
+ $("tblTitle").textContent="Travessias por dia (horário de Brasília)";
+ const mx=Math.max(1,...d.daily.map(x=>x.entrada+x.saida));
+ table(["Dia","Entradas","Saídas","Petroleiros","Navios no Golfo (pico/hora)",""],d.daily.map(x=>`<tr><td>${x.day.split("-").reverse().join("/")}</td><td>${x.entrada}</td><td>${x.saida}</td><td>${x.tankers}</td><td>${x.golfo_max||"–"}</td><td style="width:35%"><div class="bar" style="margin:0"><i style="width:${Math.round((x.entrada+x.saida)/mx*100)}%"></i></div></td></tr>`),
+  d.configured?"Ainda sem travessias registradas.":"Módulo AIS desligado.");
+}
+
+const LOAD={live:loadLive,regions:loadRegions,events:loadEvents,history:loadHistory,hormuz:loadHormuz};
 async function refresh(){try{await kpis();await LOAD[tab]()}catch(e){$("tbody").innerHTML=`<tr><td class="mut">Erro ao carregar: ${esc(e.message)}</td></tr>`}}
 function setTab(t){tab=t;document.querySelectorAll("#tabs button").forEach(b=>b.classList.toggle("on",b.dataset.t===t));
  $("wBr").style.display=t==="history"?"":"none";$("fDays").style.display=(t==="events"||t==="history")?"":"none";
