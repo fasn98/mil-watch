@@ -1980,6 +1980,7 @@ async def run(tracker, con):
            "FilterMessageTypes": ["PositionReport", "StandardClassBPositionReport",
                                   "ExtendedClassBPositionReport", "ShipStaticData"]}
     backoff = 5
+    got_msg = False
     last_flush = time.time()
     while True:
         try:
@@ -1987,9 +1988,14 @@ async def run(tracker, con):
                                           max_size=2 ** 22, open_timeout=30) as ws:
                 await ws.send(json.dumps(sub))
                 logging.info("AIS conectado; área %s", BBOX)
-                backoff = 5
+                got_msg = False
                 while True:
                     raw = await asyncio.wait_for(ws.recv(), timeout=180)
+                    if not got_msg:
+                        # só zera o backoff quando o servidor responde: com chave inválida o
+                        # aisstream aceita a conexão e derruba em seguida, sem mandar nada
+                        got_msg = True
+                        backoff = 5
                     try:
                         msg = json.loads(raw)
                     except ValueError:
@@ -2008,7 +2014,8 @@ async def run(tracker, con):
         except asyncio.TimeoutError:
             logging.warning("AIS: 3 min sem mensagens; reconectando")
         except Exception as e:
-            logging.warning("AIS: conexão caiu (%s); nova tentativa em %ss", e, backoff)
+            hint = "" if got_msg else " — servidor fechou sem responder; confira AISSTREAM_API_KEY"
+            logging.warning("AIS: conexão caiu (%s)%s; nova tentativa em %ss", e, hint, backoff)
         try:
             tracker.flush(con)
         except Exception as e:

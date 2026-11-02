@@ -112,6 +112,54 @@ class WebsocketIntegration(unittest.TestCase):
         self.assertEqual(received["sub"]["BoundingBoxes"], [[[22.0, 47.5], [30.6, 60.5]]])
         self.assertEqual(con.execute("SELECT direction, name FROM ais_transits").fetchall(), [("saida", "OIL QUEEN")])
 
+    def test_backoff_grows_when_server_drops_without_reply(self):
+        """Chave inválida: o aisstream aceita a conexão e derruba sem mandar nada.
+        O backoff tem que crescer (5, 10, 20...) em vez de voltar a 5 a cada conexão."""
+        import websockets
+        from unittest import mock
+
+        async def handler(ws, path=None):
+            await ws.recv()
+            ws.transport.abort()  # cai sem close frame, como o aisstream faz
+
+        loop = asyncio.new_event_loop()
+        ready = threading.Event()
+        holder = {}
+
+        def serve():
+            asyncio.set_event_loop(loop)
+            holder["srv"] = loop.run_until_complete(websockets.serve(handler, "127.0.0.1", 0))
+            holder["port"] = holder["srv"].sockets[0].getsockname()[1]
+            ready.set()
+            loop.run_forever()
+
+        threading.Thread(target=serve, daemon=True).start()
+        ready.wait(5)
+        aw.URL = f"ws://127.0.0.1:{holder['port']}"
+        aw.API_KEY = "bad-key"
+        delays = []
+        real_sleep = asyncio.sleep
+
+        class Stop(Exception):
+            pass
+
+        async def fake_sleep(d, *a, **k):
+            import sys
+            if not sys._getframe(1).f_code.co_filename.endswith("ais_watch.py"):
+                return await real_sleep(d, *a, **k)  # sleeps internos do websockets
+            delays.append(d)
+            if len(delays) >= 4:
+                raise Stop
+            await real_sleep(0)
+
+        async def client():
+            with mock.patch.object(aw.asyncio, "sleep", fake_sleep):
+                await aw.run(aw.Tracker(), new_db())
+        with self.assertRaises(Stop):
+            asyncio.run(asyncio.wait_for(client(), timeout=10))
+        loop.call_soon_threadsafe(loop.stop)
+        self.assertEqual(delays, [5, 10, 20, 40])
+
 
 if __name__ == "__main__":
     unittest.main()
