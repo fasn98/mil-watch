@@ -53,7 +53,7 @@ Depois de editar: `systemctl restart mil-watch-br mil-watch-br-dashboard`.
 ## Desenvolvimento
 
 ```bash
-python3 -m unittest -v          # 37 testes, offline (o de AIS usa o pacote websockets)
+python3 -m unittest -v          # 36 testes, offline (o de AIS usa o pacote websockets)
 python3 build_installer.py      # gera install.sh com os módulos embutidos
 ```
 
