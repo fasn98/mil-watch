@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -44,7 +45,7 @@ ALERT_COOLDOWN_H = float(env("ALERT_COOLDOWN_HOURS", "6"))
 SESSION_GAP = float(env("SESSION_GAP_MINUTES", "30")) * 60
 REPORT_EVERY_DAYS = float(env("REPORT_EVERY_DAYS", "7"))
 SOURCES = [s.strip() for s in env(
-    "API_SOURCES", "https://api.adsb.lol/v2/mil,https://api.airplanes.live/v2/mil").split(",") if s.strip()]
+    "API_SOURCES", "https://api.adsb.lol/v2/mil").split(",") if s.strip()]
 BR_SCOPE = env("BRAZIL_ALERT_SCOPE", "US").upper()          # US | NATO | FOREIGN | ALL
 ALERT_EVENTS = {e.strip() for e in env("ALERT_EVENTS", "emergencia,anomalia").split(",") if e.strip()}
 ALERT_EVENT_REGIONS = {r.strip() for r in env("ALERT_EVENT_REGIONS", "").split(",") if r.strip()}
@@ -80,6 +81,26 @@ def local_now(ts=None):
 
 
 # ---------------------------------------------------------------- coleta
+# Fontes que já recusaram acesso (401/403): o aviso detalhado sai uma vez por fonte,
+# para não encher o log a cada ciclo.
+_DENIED_WARNED = set()
+
+
+def _warn_access_denied(url, code):
+    host = urllib.parse.urlparse(url).netloc or url
+    if url in _DENIED_WARNED:
+        logging.warning("Fonte %s continua recusando acesso (HTTP %s)", host, code)
+        return
+    _DENIED_WARNED.add(url)
+    hint = ""
+    if "airplanes.live" in host:
+        hint = (" A API do airplanes.live passou a atender só contribuidores (quem envia dados de"
+                " um receptor ADS-B, a partir do mesmo IP); veja https://airplanes.live/get-started/.")
+    logging.warning(
+        "ATENÇÃO: a fonte %s recusou o acesso (HTTP %s). Ela pode ter passado a exigir chave"
+        " ou cadastro.%s Retire-a de API_SOURCES no .env se não for mais usá-la.", host, code, hint)
+
+
 def fetch_mil(sources=SOURCES, timeout=20):
     last_err = None
     for url in sources:
@@ -87,7 +108,14 @@ def fetch_mil(sources=SOURCES, timeout=20):
             req = urllib.request.Request(url, headers={"User-Agent": "mil-watch-br/2.0"})
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 data = json.load(r)
+            _DENIED_WARNED.discard(url)
             return data.get("ac") or data.get("aircraft") or [], url
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code in (401, 403):
+                _warn_access_denied(url, e.code)
+            else:
+                logging.warning("Falha em %s: %s", url, e)
         except Exception as e:
             last_err = e
             logging.warning("Falha em %s: %s", url, e)
