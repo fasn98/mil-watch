@@ -8,7 +8,7 @@ Só biblioteca padrão do Python 3.9+. Dois serviços: o **coletor** e o **paine
 
 | Função | Como |
 |---|---|
-| Coleta global | Endpoint `/v2/mil` do adsb.lol (reserva: airplanes.live), a cada 90 s |
+| Coleta global | Endpoint `/v2/mil` do adsb.lol, a cada 90 s (a API do airplanes.live agora só atende contribuidores; adicione-a em `API_SOURCES` se você tiver receptor) |
 | Regiões | 23 regiões aproximadas (Mar Negro, Oriente Médio, Mar do Sul da China, Brasil…) |
 | País / OTAN | Pela faixa ICAO do transponder |
 | Categoria | Pelo tipo: reabastecedor, radar, ISR, patrulha, transporte, bombardeiro, caça… |

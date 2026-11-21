@@ -67,3 +67,31 @@ class FlowTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_fetch_mil_avisa_acesso_recusado_uma_vez(monkeypatch, caplog):
+    import io, logging, urllib.error, urllib.request
+    import mil_watch
+
+    def fake_urlopen(req, timeout=20):
+        url = req.full_url
+        if "airplanes.live" in url:
+            raise urllib.error.HTTPError(url, 403, "Forbidden", {}, io.BytesIO(b""))
+        return io.BytesIO(b'{"ac": [{"hex": "abc123"}]}')
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    mil_watch._DENIED_WARNED.clear()
+    srcs = ["https://api.airplanes.live/v2/mil", "https://api.adsb.lol/v2/mil"]
+    with caplog.at_level(logging.WARNING):
+        ac, used = mil_watch.fetch_mil(srcs)
+        mil_watch.fetch_mil(srcs)
+    assert used == srcs[1] and ac[0]["hex"] == "abc123"
+    full = [r for r in caplog.records if "ATENÇÃO" in r.getMessage()]
+    assert len(full) == 1 and "contribuidores" in full[0].getMessage()
+    assert any("continua recusando" in r.getMessage() for r in caplog.records)
+
+
+def test_fonte_padrao_so_adsb_lol():
+    import mil_watch
+    if not os.environ.get("API_SOURCES"):
+        assert mil_watch.SOURCES == ["https://api.adsb.lol/v2/mil"]

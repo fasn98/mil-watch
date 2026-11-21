@@ -78,7 +78,12 @@ add_default() {  # chave, valor, comentário
   fi
 }
 add_default INTERVAL_SECONDS 90 "Coleta"
-add_default API_SOURCES "https://api.adsb.lol/v2/mil,https://api.airplanes.live/v2/mil"
+add_default API_SOURCES "https://api.adsb.lol/v2/mil" "Fontes ADS-B, em ordem (a API do airplanes.live agora exige ser contribuidor)"
+# Instalações antigas: se API_SOURCES ainda é o padrão antigo, tira o airplanes.live
+if grep -qx 'API_SOURCES=https://api.adsb.lol/v2/mil,https://api.airplanes.live/v2/mil' "$APP_DIR/.env"; then
+  sed -i 's#^API_SOURCES=.*#API_SOURCES=https://api.adsb.lol/v2/mil#' "$APP_DIR/.env"
+  say "API_SOURCES atualizado: airplanes.live removido (API agora só para contribuidores)"
+fi
 add_default DB_PATH data/milwatch.db
 add_default LOG_PATH data/milwatch.log
 add_default SESSION_GAP_MINUTES 30
@@ -109,7 +114,7 @@ chmod 600 "$APP_DIR/.env"
 if python3 -c "import urllib.request; urllib.request.urlopen(urllib.request.Request('https://api.adsb.lol/v2/mil', headers={'User-Agent':'mil-watch-br/2.0'}), timeout=20)" 2>/dev/null; then
   say "API adsb.lol acessível"
 else
-  warn "Não consegui acessar api.adsb.lol agora (o serviço tenta a fonte reserva e repete sozinho)"
+  warn "Não consegui acessar api.adsb.lol agora (o serviço repete sozinho a cada ciclo)"
 fi
 
 # ---------------------------------------------------------------- serviços
